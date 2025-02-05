@@ -41,8 +41,8 @@ init:
 		bis.w	#TBSSEL__SMCLK, &TB0CTL ; Set SMCLOCK
         bis.w	#MC__STOP, &TB0CTL ; STOP COUNTING
 
-        mov.w	#500d, &TB0CCR0 ; Initialize CCR0 = Clock Pulse
-        mov.w	#250d, &TB0CCR1 ; Initialize CCR1 = SDA pulse
+        mov.w	#100d, &TB0CCR0 ; Initialize CCR0 = Clock Pulse
+        mov.w	#50d, &TB0CCR1 ; Initialize CCR1 = SDA pulse
 
         bis.w	#CCIE, &TB0CCTL0 ; Enabled capture/compare IRQ
         bic.w	#CCIFG, &TB0CCTL0 ; Clear interrupt flag
@@ -50,7 +50,7 @@ init:
         bis.w	#CCIE, &TB0CCTL1 ; Enabled capture/compare IRQ
         bic.w	#CCIFG, &TB0CCTL1 ; Clear interrupt flag
 
-        mov.b	#11001010b, R6 ; Setting TX buffer to 11001010
+        mov.b	#11010000b, R6 ; Setting TX buffer to 0x68, the clock address
 
 		NOP
         bis.w	#GIE, SR ; Enable global maskable interrupts
@@ -65,7 +65,16 @@ main:
 
 		call 	#i2c_tx_byte
 
-		mov.b	#10101100b, R6
+		mov.b	#00000000b, R6		; SECONDS Register
+		call 	#i2c_tx_byte
+
+		mov.b	#32h, R6			; 32 Seconds
+		call 	#i2c_tx_byte
+
+		mov.b	#11h, R6			; 11 Minutes
+		call 	#i2c_tx_byte
+
+		mov.b	#13h, R6				; 13 Hours
 		call 	#i2c_tx_byte
 
 		call 	#i2c_stop
@@ -110,18 +119,15 @@ i2c_start:
 ; - Loop doing nothing until all 8 bits are transmitted and R5 state is brought to 0 (Free state)
 
 i2c_tx_byte:
-		mov.b	#1d, R5			 	; Set R5 state to TX
-		mov.b	#8d, R4			 	; We want to iterate 8 bits
-
-		bis.b	#BIT5, &P1DIR		; Set P1.5 as an output
-		bic.b	#BIT5, &P1REN		; Disable pull up/down resistor on P1.5
-		bic.b	#BIT5, &P1OUT		; Clear 1.5 output.
 
 		bis.w	#MC__UP, &TB0CTL	; START COUNTING UP
 
+		mov.b	#1d, R5			 	; Set R5 state to TX
+		mov.b	#8d, R4			 	; We want to iterate 8 bits
+
 i2c_tx_trap:
-		tst.b	R5				; Check R5 state
-		jnz		i2c_tx_trap		; Keep looping to check R5 state until R5 = 0 (FREE)
+		cmp.b	#0d, R5			; Check R5 state
+		jne		i2c_tx_trap		; Keep looping to check R5 state until R5 = 0 (FREE)
 
 		ret
 
@@ -129,6 +135,9 @@ i2c_tx_trap:
 ; - Work in Progress
 
 i2c_stop:
+		cmp.b	#0d, R5			; Check if R5 is FREE (0)
+		jne		i2c_stop
+
 		mov.b	#3d, R5			; Set R5 state to 3 (STOP)
 
 		ret
@@ -163,9 +172,16 @@ clock_return:
 ; SDA Timer
 ISR_TB0_CCR1:
 
+		cmp.b	#0d, R5			; If FREE mode
+		jeq		ret_CCR1		; Just repeat the state check
+
 		; We're first going to check stop mode, since it doesn't require the clock to be low to change SDA state
 		cmp.b	#3d, R5				; If STOP mode
 		jeq		sda_stop			; Jump to STOP mode
+
+		; Check TX ACK
+		cmp.b	#4d, R5				; If ACK mode
+		jeq		check_ACK			; Jump to CHECK ACK
 
 		; Now we check clock state, SDA should only change state when clock is low.
 		bit.b	#01000000b, P1OUT 	; Compare Clock Bit 1.6, if HIGH, return, since we shouldn't change SDA
@@ -173,28 +189,33 @@ ISR_TB0_CCR1:
 
 		; --- Next we check the TX, RX, or ACK states
 
-		; We check out bit counter, if all eight bits have been transmitted or received, we set ACK mode
-		tst.b	R4					; Check bit counter
-		jz		free_SDA			; If we've pushed all bits, set R5 state to FREE
-
-		; Check ACK
-		;cmp.b	#4d, R5				; If ACK mode
-		;jeq		sda_ACK			; Jump to ACK
-
 		; Check TX
 		cmp.b	#1d, R5				; If TX mode
-		jmp		sda_tx				; Jump to TX
+		jeq		sda_tx				; Jump to TX
 
 		; Check RX
 		; Todo
 
 sda_stop:							; We do this IF state is in R5 state STOP (3), bring SDA to HIGH, turn off timer
+		bis.b	#BIT5, &P1DIR		; Set P1.5 as an output
+		bic.b	#BIT5, &P1REN		; Disable pull up/down resistor on P1.5
+
+		bic.b	#BIT5, &P1OUT		; Bring SDA LOW
+
+		bit.b   #01000000b, P1OUT	; Check if SCL is HIGH
+		jz		ret_CCR1			; Jump to return.
+
 		bis.b	#BIT5, &P1OUT		; Set SDA to HIGH
-		bis.w	#MC__STOP, &TB0CTL 	; STOP COUNTING
+		bic.w	#MC__UP, &TB0CTL 	; STOP COUNTING
 		jmp		ret_CCR1			; Jump to return
 
 ;----------- TX method block
 sda_tx:
+		tst.b	R4					; Check bit counter
+		jz		sda_tx_ACK			; If we've pushed all bits, set R5 state to TX ACK (As in, RECEIVE THE ACK)
+
+		bic.b	#BIT5, &P1REN		; Disable pull up/down resistor on P1.5
+		bis.b	#BIT5, &P1DIR		; Set P1.5 as an output
 
 		bit.b	#10000000b, R6		; Check bit 7 of buffer
 		jnz		set_SDA				; If bit 0 is 1, set SDA HIGH
@@ -218,6 +239,13 @@ sda_tx_ACK:
 		bic.b	#BIT5, &P1DIR		; Set P1.5 as an input.
 		bis.b	#BIT5, &P1REN		; Enable pull up/down resistor on P1.5
 		bis.b	#BIT5, &P1OUT		; Make the resistor a pull-up
+
+		jmp		ret_CCR1
+
+check_ACK:
+		bit.b	#BIT5, &P1IN		; Check SDA
+		jmp		free_SDA			; If ZERO, that means we've received an ACK, so we can enter our free state for the next packet.
+									; Jump regardless, in the future I'll make this stop if we don't get an ACK, but who gives a shit.
 
 free_SDA:
 		mov.b	#0d, R5				; Set R5 state to FREE

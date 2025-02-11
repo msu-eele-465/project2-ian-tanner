@@ -25,16 +25,24 @@ StopWDT     mov.w   #WDTPW|WDTHOLD,&WDTCTL  ; Stop watchdog timer
 ;-------------------------------------------------------------------------------
 
 init:
+		; Set up SDA
 		bis.b   #BIT5,&P1OUT            ; Set P1.5 output (SDA)
         bis.b   #BIT5,&P1DIR            ; P1.5 output
 
+		; Set up SCL
         bis.b   #BIT6,&P1OUT            ; Set P1.6 output (SCL)
         bis.b   #BIT6,&P1DIR            ; P1.6 output
 
+		; Configure P4 (S1) for digital I/O
+		mov.b	#000h, &P4SEL0
+		mov.b	#000h, &P4SEL1
+
+		; Set up registers
         mov.b	#0d, R4					; Clearing R4 to use as Clock Counter
         mov.b	#0d, R5					; Clearing R5 to use as state ( 0 = FREE / 1 = TX / 2 = RX / 3 = STOP / 4 = TX MODE ACK / 5 = RX MODE ACK )
         mov.b	#0d, R6					; Clearing R6 to use as buffer
         mov.b	#0d, R7					; Clearing R7 to use for message byte size.
+        mov.w	#0d, R8					; Clearing R8 to use as a WORD to point to memory address
 
         ; Set up timer B0
 
@@ -60,64 +68,94 @@ init:
 main:
 		call 	#i2c_init
 
-		; Basic TX, just forcing out a time to be transmitted manually byte by byte
+		mov.w	#DataBlock1, R8			; DataBlock I'm using for TX
+		mov.b	#3d, R7					; We are transmitting 3 bytes
 
-		call 	#i2c_start
-		mov.b	#5d, R7				; Message size 5 bytes: TX ADD, TX SECONDS REG, TX SECONDS, TX MINUTES TX HOURS
+		call	#i2c_tx_array			; Transmit array
 
-        mov.b	#11010000b, R6 		; Setting TX buffer to 0x68, the clock address
-		call 	#i2c_tx_byte
-
-		mov.b	#00000000b, R6		; SECONDS Register
-		call 	#i2c_tx_byte
-
-		mov.b	#32h, R6			; 32 Seconds
-		call 	#i2c_tx_byte
-
-		mov.b	#11h, R6			; 11 Minutes
-		call 	#i2c_tx_byte
-
-		mov.b	#13h, R6			; 13 Hours
-		call 	#i2c_tx_byte
-
-		call 	#i2c_stop
-
-		; Basic RX, just forcing out a time to be transmitted manually byte by byte
+		NOP								; Breakpoint
 
 continuous:
-		call 	#i2c_start
-		mov.b	#6d, R7				; Message size 6 bytes: TX ADD, TX SECONDS REG, RX ADD, RX SECONDS, RX MINUTES, RX HOURS
 
-		mov.b	#11010000b, R6 		; Setting TX buffer to 0x68, the clock address
-		call 	#i2c_tx_byte
+		mov.w	#DataBlock2, R8			; Datablock I'm using for RX
+		mov.b	#3d, R7					; We are receiving 3 bytes
 
-		mov.b	#00000000b, R6		; SECONDS Register
-		call 	#i2c_tx_byte
+		call	#i2c_rx_array			; Receive to array
 
-		call 	#i2c_stop
-
-		call 	#i2c_start
-
-		mov.b	#11010001b, R6 		; Setting TX buffer to 0x68, the clock address + READ BIT
-		call 	#i2c_tx_byte
-
-		call	#i2c_rx_byte		; Seconds
-
-		call	#i2c_rx_byte		; Minutes
-
-		call	#i2c_rx_byte		; Hours
-
-		call 	#i2c_stop
-
-		jmp		continuous
-
-trap:
-
-		jmp trap
+		jmp continuous
 
 ;-------------------------------------------------------------------------------
 ; Subroutines
 ;-------------------------------------------------------------------------------
+
+; /---- I2C TX Array Subroutine
+i2c_tx_array:
+
+		add.b	#2d, R7				; Since we send the address and one register, add 2 more bytes
+
+		call 	#i2c_start
+
+		mov.b	@R8+, R6 			; Setting TX buffer to what should be the address.
+		rla.b	R6					; Rotate TX buffer left so LSB is 0, which results in a WRITE bit
+		call 	#i2c_tx_byte
+
+		mov.b	@R8+, R6			;Set TX buffer to second array element, which should be the REGISTER ADDRESS
+		call 	#i2c_tx_byte
+
+i2c_tx_array_loop:
+		tst.b	R7					; Check bytes remaining
+		jz		i2c_tx_array_return ; Return if zero
+
+		mov.b	@R8+, R6			; Continue to iterate down array
+		call	#i2c_tx_byte		; Transmit array data
+
+		jmp		i2c_tx_array_loop
+
+i2c_tx_array_return:
+
+		call 	#i2c_stop
+
+		ret
+
+; /-- I2C RX Array Subroutine
+i2c_rx_array:
+
+		add.b	#3d, R7				; Since we send two addresses and one register, add 3 more bytes
+
+		call 	#i2c_start
+
+		mov.b	@R8+, R6			; Setting TX buffer to what should be the address.
+		rla.b	R6					; Rotate TX buffer left so LSB is 0, which results in a WRITE bit
+		call 	#i2c_tx_byte
+
+		mov.b	@R8+, R6			; Set TX buffer to second array element, which should be the REGISTER ADDRESS
+		call 	#i2c_tx_byte
+
+		call 	#i2c_stop			; Stop TXing
+
+		call 	#i2c_start
+
+		mov.b	@R8+, R6			; Setting TX buffer to what should be the address.
+		rla.b	R6					; Rotate TX buffer left so LSB is 0
+		bis.b	#BIT0, R6			; Set bit to READ
+		call 	#i2c_tx_byte
+
+i2c_rx_array_loop:
+		tst.b	R7					; Check bytes remaining
+		jz		i2c_rx_array_return	; Return if zero
+
+		mov.b	#0d, R6				; Clear buffer
+		call	#i2c_rx_byte		; Receive the byte
+		;mov.w	R6, &202Ah			FUCK
+
+		jmp		i2c_rx_array_loop
+
+i2c_rx_array_return:
+
+		call 	#i2c_stop
+
+		ret
+
 
 ; /---- I2C Init
 ; Will bring SDA and SCL HIIGH
@@ -214,22 +252,12 @@ i2c_stop_trap:
 
 
 
-
-
 ;-------------------------------------------------------------------------------
 ; Interrupt Service Routines
 ;-------------------------------------------------------------------------------
 
 ; SCL Timer
 ISR_TB0_CCR0:
-
-		;cmp.b	#3d, R5				; If STOP mode
-		;jeq		clock_stop			; JUMP to STOP mode
-		;jmp		clock_run			; Otherwise, run clock normally
-
-;clock_stop:
-		;bis.b	#BIT6, &P1OUT		; Set CLOCK HIGH
-		;jmp		clock_return
 
 clock_run:
 		xor.b	#BIT6, &P1OUT		; Flip Clock
@@ -302,15 +330,11 @@ sda_tx:
 
 set_SDA:
 		bis.b	#BIT5, &P1OUT		; Set SDA HIGH
-		jmp		roll_right_Buffer	; Jump to Roll buffer
+		jmp		roll_left_Buffer	; Jump to Roll buffer
 
 clear_SDA:
 		bic.b	#BIT5, &P1OUT		; Set SDA to LOW, will roll right after.
-
-roll_right_Buffer:
-		rlc.b	R6					; Roll buffer left so new bit to TX is the one to be read
-		dec.b	R4					; Buffer rolled, decrement our bit counter by 1
-		jmp 	ret_CCR1
+		jmp		roll_left_Buffer	; Jump to Roll Buffer
 
 ;----------- End TX method block
 
@@ -319,11 +343,24 @@ sda_rx:
 		tst.b	R4					; Check bit counter
 		jz		sda_rx_ACK			; If we've pushed all bits, set R5 state to RX ACK (As in, TRANSMIT THE ACK)
 
-		dec.b	R4					; Buffer rolled, decrement our bit counter by 1
+		bit.b	#BIT5, &P1IN		; Check SDA
+		jnz		set_buffer			; If SDA is 1, set buffer LSB HIGH
+		jmp		clear_buffer		; Otherwise, clear buffer LSB
 
-		jmp		ret_CCR1
+set_buffer:
+		bis.b	#BIT0, R6			; Set buffer LSB HIGH
+		jmp		roll_left_Buffer	; Jump to Roll Buffer
+
+clear_buffer:
+		bic.b	#BIT7, R6			; Set buffer LSB LOW
+		jmp		roll_left_Buffer	; Jump to Roll Buffer
 
 ;----------- End RX Method Block
+
+roll_left_Buffer:
+		rla.b	R6					; Roll buffer left so new bit to TX is the one to be read
+		dec.b	R4					; Buffer rolled, decrement our bit counter by 1
+		jmp 	ret_CCR1
 
 sda_tx_ACK:
 		mov.b	#4d, R5				; Set state to TX ACK mode, as in we should be RECEIVING the ACK between TX PACKETS
@@ -338,6 +375,12 @@ sda_rx_ACK:
 		mov.b	#5d, R5				; Set state to RX ACK mode, as in we should be TRANSMITTING the ACK between RX PACKETS
 		bic.b	#BIT5, &P1REN		; Disable pull up/down resistor on P1.5
 		bis.b	#BIT5, &P1DIR		; Set P1.5 as an output
+
+
+		rrc.b	R6					; Allign Buffer
+		bic.b	#BIT7, R6			; Allign Buffer
+
+
 
 		tst.b	R7					; Check Byte Counter
 		jz		sda_rx_NACK			; Return as ACK if byte counter isn't 0, otherwise, we send a NACK.
@@ -368,6 +411,20 @@ ret_CCR1:
 		reti
 
 ;-------------------------------------------------------------------------------
+; Memory Allocation
+;-------------------------------------------------------------------------------
+
+		.data				; Allocate variables in data memory
+		.retain				; Keep these statements even if not used
+
+		; Format for arrays: Address, Register, Data*
+		; When setting byte size in R7, set to the number of DATA packets
+
+DataBlock1: .short 0068h, 1132h, 0012h 	; TX Data (Address 68, Register 0, 32 Seconds, 11 Minutes, 13 Hours)
+
+DataBlock2: .short 0068h, 0068h, 0000h	; RX Data (Address 68, Register 0, Free, Free, Free)
+
+;-------------------------------------------------------------------------------
 ; Stack Pointer definition
 ;-------------------------------------------------------------------------------
             .global __STACK_END
@@ -378,9 +435,9 @@ ret_CCR1:
 ;-------------------------------------------------------------------------------
             .sect   ".reset"                ; MSP430 RESET Vector
             .short  RESET
-            
-            .sect	".int43"
+
+            .sect	".int43"				; TB0 CCR0 Vector
             .short	ISR_TB0_CCR0
 
-            .sect	".int42"
+            .sect	".int42"				; TB0 CCR1 Vector
             .short	ISR_TB0_CCR1
